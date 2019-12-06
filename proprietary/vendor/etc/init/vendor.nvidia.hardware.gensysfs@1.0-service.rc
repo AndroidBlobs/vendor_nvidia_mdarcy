@@ -1,0 +1,4 @@
+service vendor_nvidia_hardware_gensysfs /vendor/bin/hw/vendor.nvidia.hardware.gensysfs@1.0-service
+    class hal
+    user system
+    group system

@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!-- any change to version string of any fw MUST be signed-off/approved by SQA before -->
+<firmwares>
+	<firmware name="EMMC FW" skip="No">
+		<function>check_emmc_fw</function>
+		<version>4353312e34302020</version>
+		<version>3733313033353137</version>
+		<required>MDarcy</required>
+		<exception>No such file or directory</exception>
+	</firmware>
+
+	<firmware name="WIFI FW" skip="No">
+		<function>check_wifi_fw</function>
+		<version>7.35.349.69</version>
+		<required>MDarcy</required>
+	</firmware>
+
+	<firmware name="BT FW" skip="No">
+		<function>check_bt_fw</function>
+		<version>94</version>
+		<required>MDarcy</required>
+	</firmware>
+
+	<firmware name="Xusb FW" skip="No">
+		<command>cat /sys/class/tegra-firmware/70090000.xusb/version</command>
+		<version>Firmware timestamp: 2019-06-26 07:00:53 UTC, Version: 51.05 release</version>
+		<required>MDarcy</required>
+	</firmware>
+</firmwares>

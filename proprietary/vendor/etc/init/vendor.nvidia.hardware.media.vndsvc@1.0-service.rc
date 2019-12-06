@@ -1,0 +1,5 @@
+service mediavndsvc-1-0 /vendor/bin/hw/vendor.nvidia.hardware.media.vndsvc@1.0-service
+    class hal
+    user media
+    onrestart restart mediacodec
+    interface vendor.nvidia.hardware.media.propertyhal@1.0 default

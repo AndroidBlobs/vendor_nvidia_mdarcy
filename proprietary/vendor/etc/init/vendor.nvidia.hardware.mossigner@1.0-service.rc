@@ -1,0 +1,5 @@
+service vendor.mossigner-hal-service /vendor/bin/hw/vendor.nvidia.hardware.mossigner@1.0-service
+    class hal
+    user system
+    group system
+

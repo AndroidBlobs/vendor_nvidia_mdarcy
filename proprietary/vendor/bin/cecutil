@@ -1,0 +1,338 @@
+#!/vendor/bin/env python
+# Copyright (c) 2016-2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+from binascii import unhexlify
+from math import log
+from random import randint
+from subprocess import call, Popen, PIPE
+from sys import argv, exit
+import os.path
+import errno
+import fcntl
+import array
+
+NAME = os.path.basename(argv[0])
+TEGRA_CEC = "/dev/tegra_cec"
+CEC_LOGICAL_ADDR_CONFIG = "/sys/devices/platform/tegra_cec/cec_logical_addr_config"
+EOM = 1
+IOCTL_DUMP_REGISTERS    = 17154
+IOCTL_SET_RX_SNOOP      = 17155
+IOCTL_GET_RX_SNOOP      = 17156
+IOCTL_GET_POST_RECOVERY = 17157
+
+def logcat(message):
+    call(["log", "-p", "v", "-t", NAME, message])
+
+def usage():
+    print "\
+usage: " + NAME + " <command>\n\
+commands:\n\
+    -l, --get-logical-addr          Get device logical address\n\
+    -s, --set-logical-addr <addr>   Set device logical address, use with caution\n\
+                                        addr can be hex with addr bit set or decimal addr\n\
+                                        e.g. 0x10 = 4\n\
+    -p, --get-physical-addr         Get device physical address\n\
+    -f, --gen-fake-physical-addr    Generate a fake device physical address not equal to this device's\n\
+    -d, --daemon                    Run in daemon mode to print all received messages\n\
+    -t, --tx <frame> [-F/-L]        Send CEC frame, format \"sd:op[:bb]\"\n\
+                                        s = src addr\n\
+                                        d = dest addr\n\
+                                        op = opcode\n\
+                                        bb = optional payload bytes\n\
+                                        Replace frame src addr with device address\n\
+                                        Use -F to override and send with incorrect src address\n\
+                                        Use -L to loopback and send message to self\n\
+    --dump-registers                Dump CEC hardware registers\n\
+    --enable-rx-snoop               Enalbe RX snoop mode, all CEC frameworks can be received by CEC hardware\n\
+    --disable-rx-snoop              Disable RX snoop mode, only CEC frameworks to itself can be received by CEC hardware\n\
+    --get-rx-snoop                  Get RX snoop mode\n\
+    --get-post-recovery             Get post_recovery\n\
+                                    For more info, see http://www.cec-o-matic.com"
+"""
+Undocumented commands:
+    -v, --verification              SQA verification
+    --tests                         Unit tests for this utility
+"""
+
+def get_logical_address():
+    with open(CEC_LOGICAL_ADDR_CONFIG, 'r') as f:
+        x = f.readline().rstrip()
+        x = '0x8000' if x == '0x0' else x # adjust for 0 case, set to 2**15 so log works
+        return int(log(int(x, 16), 2))
+
+def set_logical_address(addr):
+    try:
+        # parse decimal
+        addr = "0x%x" % (1 << int(addr))
+    except ValueError:
+        try:
+            # parse hex
+            addr = "0x%x" % int(addr, 16)
+        except ValueError:
+            print "Invalid argument"
+            return 1
+    addr = "0x0" if addr == "0x8000" else addr
+    logcat("set logical addr " + addr)
+    with open(CEC_LOGICAL_ADDR_CONFIG, 'w') as f:
+        f.write(addr)
+
+def get_hdmi_dc_head():
+    dc_heads = [ "/d/tegradc.0/", "/d/tegradc.1/", "/d/tegradc.2/" ]
+    for dc_head in dc_heads:
+        dc_out_type = dc_head + "out_type"
+        if os.path.exists(dc_out_type):
+            with open(dc_out_type, 'r') as f:
+                lines = f.readlines()
+                if len(lines) >= 2 and 'TEGRA_DC_OUT_HDMI' in lines[1]:
+                    return dc_head
+
+def get_physical_address():
+    if (get_hdmi_dc_head() == None):
+        return 0xffff
+    with open(get_hdmi_dc_head() + "edid", 'r') as f:
+        l = [ line.rstrip().split() for line in f ]
+        edid = [ item for sublist in l for item in sublist ] # flatten
+        """
+        Search edid for VSD (Vendor Specific Data) block which precedes CEC
+        physical address. VSD block starts with 0x03, 0x0c, 0x00 (HDMI
+        registration number 00-0c-03, LSB order)
+        """
+        for i in range(len(edid)-5):
+            if edid[i] == '03' and edid[i+1] == '0c' and edid[i+2] == '00':
+                return (int(edid[i+3], 16) << 8) | int(edid[i+4], 16)
+    return 0xffff
+
+def generate_random_physical_address():
+    return randint(0, 0xffff)
+
+def generate_fake_physical_address_not_on_path():
+    phy_addr = get_physical_address()
+    while True:
+        random_phy_addr = generate_random_physical_address()
+        if not is_on_path(random_phy_addr, phy_addr):
+            return random_phy_addr
+
+def format_physical_address(addr):
+    return '%0.2x:%0.2x' % (((addr >> 8) & 0xff), addr & 0xff)
+
+# logic for depth, is_on_path copied from HdmiCecLocalDevicePlayback.java
+def depth(addr):
+    first   = (addr & 0xF000) != 0
+    second  = (addr & 0x0F00) != 0
+    third   = (addr & 0x00F0) != 0
+    fourth  = (addr & 0x000F) != 0
+    return 4 if fourth else 3 if third else 2 if second else 1 if first else 0
+
+def is_on_path(node, leaf):
+    if node == 0:
+        return False
+    mask = 0xFFFF - ((1 << (4 - depth(node)) * 4) - 1)
+    return node == (leaf & mask)
+
+def daemon():
+    output = Popen(["lsof"], stdout=PIPE).communicate()[0]
+    if output.find(TEGRA_CEC) != -1:
+        print IOError(errno.EBUSY, "Device or resource busy")
+        print "\
+Daemon mode does not work if another process is reading from the CEC dev node\n\
+To disable Android HDMI-CEC process:\n\
+    remove /vendor/etc/permissions/android.hardware.hdmi.cec.xml\n\
+    reboot"
+        return 1
+    with open(TEGRA_CEC, 'rb') as f:
+        buf = []
+        while True:
+            rx = f.read(2)
+            buf.append(format(ord(rx[0]), '02x'))
+            if ord(rx[1]) & EOM:
+                print ':'.join(buf)
+                buf = []
+
+def replace_src_addr(frame, log_addr):
+    src = hex(log_addr)[2]
+    return str(src) + frame[1:]
+
+def replace_dest_addr(frame, log_addr):
+    src = hex(log_addr)[2]
+    return frame[0] + str(src) + frame[2:]
+
+def tx(frame, force=False, loopback=False):
+    log_addr = get_logical_address()
+    if log_addr == 0xF:
+        print IOError(errno.EHOSTUNREACH, "No route to host")
+        print "Try setting logical address first"
+        return 1
+    if not force:
+        frame = replace_src_addr(frame, log_addr)
+    if loopback:
+        frame = replace_dest_addr(frame, log_addr)
+    logcat("tx " + frame)
+    frame = frame.translate(None, ': ')
+    try:
+        with open(TEGRA_CEC, 'wb') as f:
+            f.write(unhexlify(frame))
+    except IOError as e:
+        if e.errno == errno.EHOSTUNREACH:
+            print e
+            print "Device doesn't exist"
+            return 1
+        else:
+            raise e
+
+def dump_registers():
+    buf = array.array('h', [0])
+    try:
+        with open(TEGRA_CEC, 'wb') as f:
+            fcntl.ioctl(f, IOCTL_DUMP_REGISTERS, buf, 1)
+    except IOError as e:
+        print(e)
+
+def set_rx_snoop(state):
+    buf = array.array('h', [state])
+    try:
+        with open(TEGRA_CEC, 'wb') as f:
+            fcntl.ioctl(f, IOCTL_SET_RX_SNOOP, buf, 1)
+    except IOError as e:
+        if e.errno == errno.EHOSTUNREACH:
+            print e
+            print "Device doesn't exist"
+            return 1
+        else:
+            raise e
+
+def get_rx_snoop():
+    buf = array.array('h', [0])
+    try:
+        with open(TEGRA_CEC, 'wb') as f:
+            fcntl.ioctl(f, IOCTL_GET_RX_SNOOP, buf, 1)
+    except IOError as e:
+        if e.errno == errno.EHOSTUNREACH:
+            print e
+            print "Device doesn't exist"
+            return 1
+        else:
+            raise e
+    print buf[0]
+    return buf[0]
+
+def get_post_recovery():
+    buf = array.array('h', [0])
+    try:
+        with open(TEGRA_CEC, 'wb') as f:
+            fcntl.ioctl(f, IOCTL_GET_POST_RECOVERY, buf, 1)
+    except IOError as e:
+        if e.errno == errno.EHOSTUNREACH:
+            print e
+            print "Device doesn't exist"
+            return 1
+        else:
+            raise e
+    print buf[0]
+    return buf[0]
+
+def tests():
+    init_la = get_logical_address()
+
+    # get_logical_address/set_logical_address tests
+    set_logical_address("0")
+    assert get_logical_address() == 0
+    set_logical_address("4")
+    assert get_logical_address() == 4
+    set_logical_address("8")
+    assert get_logical_address() == 8
+    set_logical_address("11")
+    assert get_logical_address() == 11
+    set_logical_address("15")
+    assert get_logical_address() == 15
+    set_logical_address("0x1")
+    assert get_logical_address() == 0
+    set_logical_address("0x0")
+    assert get_logical_address() == 15
+    set_logical_address("0x800")
+    assert get_logical_address() == 11
+    set_logical_address("0x100")
+    assert get_logical_address() == 8
+    set_logical_address("0x10")
+    assert get_logical_address() == 4
+
+    # tx tests
+    assert replace_src_addr("80:0d", 4) == "40:0d"
+    assert replace_dest_addr("08:44:01", 4) == "04:44:01"
+    assert replace_src_addr("40:0d", 4) == "40:0d"
+    assert replace_dest_addr("04:44:01", 4) == "04:44:01"
+    set_logical_address("15")
+    assert replace_dest_addr("04:44:01", 15) == "0f:44:01"
+    assert replace_src_addr("40:0d", 15) == "f0:0d"
+    # TODO: test tx(), and force
+
+    # get_physical_address tests
+    # TODO: test get_physical_address()
+
+    assert not is_on_path(0x0000, 0x1200)
+    assert is_on_path(0x1000, 0x1200)
+    assert not is_on_path(0x2000, 0x1200)
+    assert is_on_path(0x1200, 0x1200)
+    assert not is_on_path(0x1300, 0x1200)
+    assert is_on_path(0xff00, 0xffff)
+    assert not is_on_path(0xfb00, 0xffff)
+    assert not is_on_path(0x1300, 0xffff)
+
+    set_logical_address(init_la)
+    print "Pass"
+
+def verification():
+    print "Not implemented yet"
+    pass
+
+def main():
+    res = 0
+    try:
+        with open(TEGRA_CEC, 'r') as f:
+            pass
+    except IOError as e:
+        if e.errno == errno.EACCES:
+            print e
+            print "Not running as root. Try \"adb root\" first."
+            return 1
+    if len(argv) == 2 and (argv[1] == "-l" or argv[1] == "--get-logical-addr"):
+        print get_logical_address()
+    elif len(argv) == 3 and (argv[1] == "-s" or argv[1] == "--set-logical-addr"):
+        ret = set_logical_address(argv[2])
+    elif len(argv) == 2 and (argv[1] == "-p" or argv[1] == "--get-physical-addr"):
+        print format_physical_address(get_physical_address())
+    elif len(argv) == 2 and (argv[1] == "-f" or argv[1] == "--gen-fake-physical-addr"):
+        print format_physical_address(generate_fake_physical_address_not_on_path())
+    elif len(argv) == 2 and (argv[1] == "-d" or argv[1] == "--daemon"):
+        daemon()
+    elif len(argv) == 3 and (argv[1] == "-t" or argv[1] == "--tx"):
+        res = tx(argv[2])
+    elif len(argv) == 4 and (argv[1] == "-t" or argv[1] == "--tx") and argv[3] == "-F":
+        res = tx(argv[2], True, False)
+    elif len(argv) == 4 and (argv[1] == "-t" or argv[1] == "--tx") and argv[3] == "-L":
+        res = tx(argv[2], True, True)
+    elif len(argv) == 2 and argv[1] == "--tests":
+        tests()
+    elif len(argv) == 2 and (argv[1] == "-v" or argv[1] == "--verification"):
+        verification()
+    elif len(argv) == 2 and argv[1] == "--dump-registers":
+        dump_registers()
+    elif len(argv) == 2 and argv[1] == "--enable-rx-snoop":
+        set_rx_snoop(1)
+    elif len(argv) == 2 and argv[1] == "--disable-rx-snoop":
+        set_rx_snoop(0)
+    elif len(argv) == 2 and argv[1] == "--get-rx-snoop":
+        get_rx_snoop()
+    elif len(argv) == 2 and argv[1] == "--get-post-recovery":
+        get_post_recovery()
+    else:
+        usage()
+    exit(res)
+
+if __name__ == "__main__":
+    main()

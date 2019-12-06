@@ -1,0 +1,3 @@
+service prcurlservice /vendor/bin/prcurlservice
+    class main
+    group mediadrm drmrpc inet

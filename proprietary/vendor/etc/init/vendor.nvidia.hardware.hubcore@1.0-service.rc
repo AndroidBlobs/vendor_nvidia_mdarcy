@@ -1,0 +1,16 @@
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA Corporation and its licensors retain all intellectual property and
+# proprietary rights in and to this software and related documentation.  Any
+# use, reproduction, disclosure or distribution of this software and related
+# documentation without an express license agreement from NVIDIA Corporation
+# is strictly prohibited.
+
+service hal_hubcore_default /vendor/bin/hw/vendor.nvidia.hardware.hubcore@1.0-service
+    class hal
+    user system
+    group system
+    seclabel u:r:hal_hubcore_default:s0
+
+on property:vendor.2g_ram_enabled=1
+    stop hal_hubcore_default
